@@ -26,10 +26,3 @@ git clone https://github.com/alexgomb/covid_transcript.git
 * COVID-19 samples display heterogeneous type I interferon and immunoglobulin signatures alongside a novel mitotic activation program (e.g., spindle assembly, nuclear division).
 * GO-BP enrichment and REVIGO highlight three functional axes: mitosis, immune cytotoxicity, and tissue remodelling.
 
-## License
-
-This project is licensed under the MIT License.
-
-## Contact
-
-For questions or feedback, open an issue or email \[[your.email@example.com](mailto:your.email@example.com)].
