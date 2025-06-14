@@ -16,7 +16,7 @@ This repository compares peripheral blood transcriptomic signatures between COVI
 Clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/rna-seq-covid19-comparison.git
+git clone https://github.com/alexgomb/covid_transcript.git
 ```
 
 ## Biological Insights
