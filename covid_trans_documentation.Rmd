@@ -1,0 +1,774 @@
+---
+title: 'Comparative Peripheral Blood Transcriptomics: SARS-CoV-2 Triggers Mitotic Activation Amid Interferon Dysregulation'
+author: "Alejandro Gombau García"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    fig_cap: yes
+    toc: true
+    toc_depth: 3
+header-includes:
+  - \usepackage{float}
+  - \usepackage{placeins}
+  - \floatplacement{figure}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.pos="!H")
+```
+
+# Abstract
+
+Integrating our peripheral-blood RNA-seq analysis with McClain et al.’s clinical validation, we characterised transcriptomic signatures in COVID-19, bacterial pneumonia, and healthy controls using public data (GEO GSE161731). We constructed a `SummarizedExperiment` object (metadata, counts, genomic ranges), randomly sampled 75 profiles, filtered low-expression genes with `filterByExpr`, applied TMM normalisation and transformed to \(\log_{2}\)\text{-}CPM. PCA and MDS confirmed cohort as the main variance driver, with batch and sex as covariates. The **voom+limma** workflow (\(\lvert \log_{2}\mathrm{FC}\rvert \ge 1.5\), FDR < 0.05) recapitulated heterogeneous interferon and immunoglobulin signatures (auROC aprox. 0.95) and revealed a novel mitotic activation programme in COVID-19. Bacterial pneumonia induced pro-inflammatory and coagulation/fibrinolysis pathways. GO-BP enrichment and REVIGO highlighted mitosis, immune cytotoxicity, and tissue remodelling, suggesting SARS-CoV-2 reprogrammes both antiviral immunity and cell-proliferation in blood.
+
+
+
+# Objectives
+
+- Characterize the differential gene-expression profiles between patients with COVID-19, bacterial pneumonia, and healthy controls.  
+- Adjust the analysis for confounding variables (batch, sex) by including these covariates in the design.  
+- Identify genes with \(\lvert \log_{2}\mathrm{FC}\rvert \ge 1.5\) and FDR < 0.05 in the Bacterial vs healthy and COVID-19 vs healthy comparisons.  
+- Explore the global structure of the data with PCA and MDS to detect clustering and technical biases.  
+- Perform GO-BP functional enrichment of the genes over-expressed in COVID-19 and visualize it with REVIGO to reveal key biological processes.  
+
+
+
+# Methods
+
+## Construction of the `SummarizedExperiment` object
+
+First, we install and load essential Bioconductor packages: `GEOquery` to access the GEO repository, `EnsDb.Hsapiens.v86` and `GenomicRanges` to handle gene annotation and genomic coordinates, and `SummarizedExperiment` to combine counts and metadata in a single container. Next, we download the series `GSE161731` [1] as an `ExpressionSet` object and extract its metadata table (`pData`), renaming its rows with the GEO accessions (GSM…) and cleaning the `subject_id` field to retain only the internal identifier of each subject.
+
+In the second step, we use `getGEOSuppFiles()` to download the supplementary files: the raw count matrix (`GSE161731_counts.csv.gz`) and the mapping table between RNA identifiers (`rna_id`) and subjects (`GSE161731_key.csv.gz`). We load the count matrix into a `data.frame` with genes as rows and `rna_id` as columns, while the `key` table allows us to map each matrix column to a GEO accession.
+
+To align counts with metadata, we build a mapping vector that links each `rna_id` to its corresponding GSMxxxxx, discarding those without a match. We filter the count matrix to keep only the mappable columns and rename those columns with the GEO accessions. We then extract from the metadata table the rows corresponding to those samples and, because there were technical replicates that produced duplicate names, we apply `make.unique()` to preserve unique identifiers and thus ensure that the count matrix columns and metadata rows match exactly.
+
+Finally, we obtain the genomic coordinates of all human genes using `genes()` from `EnsDb.Hsapiens.v86` and compute the intersection with the IDs present in our filtered matrix. We create a final count matrix (`counts3`) containing only these shared genes and a `GRanges` object (`gr_filt`) with their ranges, named by `gene_id`. With this, we build a `SummarizedExperiment` object that integrates the count matrix, genomic coordinates, and aligned metadata, leaving it ready for normalization, exploration, and differential-expression analysis.
+
+
+```{r message=FALSE, warning=FALSE}
+# Install and load packages
+
+library(GEOquery)
+library(EnsDb.Hsapiens.v86)
+library(GenomicRanges)
+library(SummarizedExperiment)
+library(edgeR)
+library(limma)
+
+
+
+# Download and prepare metadadata
+gse <- getGEO("GSE161731", GSEMatrix=TRUE, getGPL=FALSE)[[1]]
+pheno <- pData(gse)
+rownames(pheno) <- pheno$geo_accession
+pheno$subject_id_clean <- sub("^subject_id: ", "", pheno$characteristics_ch1)
+
+
+# Download a read counts
+
+dir.create("data_raw/supplementary", recursive = TRUE, showWarnings = FALSE)
+getGEOSuppFiles("GSE161731",
+                baseDir      = "data_raw/supplementary",
+                makeDirectory = FALSE)
+
+counts_path <- "data_raw/supplementary/GSE161731_counts.csv.gz"
+counts      <- read.csv(counts_path,
+                        row.names       = 1,
+                        check.names     = FALSE,
+                        stringsAsFactors= FALSE)
+
+key_path <- "data_raw/supplementary/GSE161731_key.csv.gz"
+key      <- read.csv(key_path,
+                     check.names     = FALSE,
+                     stringsAsFactors= FALSE)
+
+
+# Map with rna_id -> geo_accesion
+mapping <- setNames(
+  rownames(pheno)[ match(key$subject_id, pheno$subject_id_clean) ],
+  key$rna_id
+)
+# Delete unmatched entries
+mapping <- mapping[!is.na(mapping)]
+
+# Filter count matrix
+common_rna <- intersect(colnames(counts), names(mapping))
+counts2    <- counts[, common_rna, drop = FALSE]
+mapping2   <- mapping[common_rna]
+
+
+# Build colData aligning to counts (so we solve dups)
+# ======================================
+# Extract rows from pheno adapting to mapping2
+pheno2 <- pheno[mapping2, , drop = FALSE]
+
+# Make unique rownames and columns using suffix
+rownames(pheno2) <- make.unique(mapping2)
+colnames(counts2) <- rownames(pheno2)
+
+# Check
+stopifnot(identical(colnames(counts2), rownames(pheno2)))
+
+
+# Obtain genomic ranges and filtering genes
+
+genes_gr     <- genes(EnsDb.Hsapiens.v86, return.type = "GRanges")
+common_genes <- intersect(rownames(counts2), genes_gr$gene_id)
+
+counts3 <- as.matrix(counts2[common_genes, , drop = FALSE])
+gr_filt <- genes_gr[ match(common_genes, genes_gr$gene_id) ]
+names(gr_filt) <- common_genes
+
+
+# SummarizedExperiment
+se <- SummarizedExperiment(
+  assays    = SimpleList(counts = counts3),
+  rowRanges = gr_filt,
+  colData   = DataFrame(pheno2)
+)
+```
+
+```{r message=FALSE, warning=FALSE}
+# loading from local
+se <- readRDS("se_gse161731.rds")
+```
+
+## Selection of the cohorts of interest and sampling
+
+We focus exclusively on the three cohorts of interest (COVID-19, bacterial pneumonia, and healthy controls). First, we extract from the `colData` slot the field `characteristics_ch1.4` and strip the “cohort:” prefix to create a new `cohort` column with the values “COVID-19”, “Bacterial”, or “healthy”.
+
+We then filter the `SummarizedExperiment` object to retain only those samples whose cohort belongs to this set. We compute the random seed as the sum of the UTF-8 codes of the string "*covid19*", set it with `set.seed()`, and, using `sample()`, randomly draw 75 columns from this subset to produce `se_rand`, which stores them.  
+Selecting just 75 samples reduces the computational burden of the downstream analyses.
+
+
+```{r}
+# Seed
+myseed <- sum(utf8ToInt("covid19"))
+set.seed(myseed)
+```
+
+```{r}
+# Extract clean cohort from colData
+colData(se)$cohort <- sub("^cohort: ", "",
+                          colData(se)$characteristics_ch1.4)
+
+# Define cohorts
+target <- c("COVID-19", "Bacterial", "healthy")
+
+# SummarizedExperiment
+se_sub <- se[, colData(se)$cohort %in% target]
+
+
+# random select 75 samples
+
+selected_samples <- sample(colnames(se_sub), size = 75)
+
+# random mix
+
+se_rand <- se_sub[, selected_samples]
+
+```
+
+## Filtering lowly expressed genes
+
+For filtering we used `filterByExpr` [2] from the **edgeR** package. This function internally computes an optimal CPM threshold based on the group sizes and number of samples, and applies it in a unified manner.
+
+It is fairly robust by default, especially when group sizes are unbalanced—as is the case here. On the downside, it can feel somewhat “opaque” or hard to justify in terms of how the thresholding parameters are chosen.
+
+
+```{r}
+
+# Convertimos conteos a un objeto DGEList
+# Switch to DGEList objetct
+dge <- DGEList(counts = assay(se_rand, "counts"))
+
+
+# Defining a group factor from cohort
+grp <- colData(se_rand)$cohort
+
+# Using with flexible criteria filtering by group and sample size
+
+keep <- filterByExpr(dge, group = grp)
+
+# Subset of the SummarizedExperiment with only the filtered genes
+se_filt <- se_rand[keep, ]
+```
+
+## Exploratory analysis
+
+### Principal components
+
+For dimensionality reduction we convert the filtered count matrix into a `DGEList` object and apply TMM normalization (`calcNormFactors`) to correct for differences in sequencing depth and composition bias across samples. We then transform the data to log2-CPM scale with a `prior.count = 1`, which stabilizes the variance for low-expression genes. This vector of normalized values is stored as a new `logCPM` assay within our `SummarizedExperiment`. For principal-component analysis (PCA) [3], we extract that matrix, transpose it (samples × genes), and use `prcomp` with centering (no additional scaling) to identify the directions of greatest variance in gene-expression space.
+
+
+```{r echo=FALSE}
+# Create DGEList from the filtered counts
+dge_filt <- DGEList(counts = assay(se_filt, "counts"))
+
+# Calculate TMM normalization factors
+dge_filt <- calcNormFactors(dge_filt)
+
+# Obtain log2-CPM with a prior.count = 1
+logCPM <- cpm(dge_filt, log = TRUE, prior.count = 1)
+
+# Save this new assay within the SE
+assay(se_filt, "logCPM") <- logCPM
+
+
+
+
+# Principal Component Analysis (PCA) ---------------------------
+
+# a) Extract the log-CPM matrix and transpose it (samples × genes)
+mat <- t(assay(se_filt, "logCPM"))
+
+# b) Run PCA (centering, no variable scaling)
+pca <- prcomp(mat, center = TRUE, scale. = FALSE)
+
+
+```
+
+### MDS
+
+Multidimensional scaling (MDS) is particularly useful for supporting our earlier PCA. It converts pairwise expression distances between samples into a low-dimensional space, allowing us to directly visualise the global similarity (or dissimilarity) of transcriptomic profiles. MDS complements PCA because it makes no assumption of linearity in the variance structure [4].
+
+
+```{r echo=FALSE}
+
+
+# Calcular MDS y devolver coordenadas
+# Calculaate MDS and return coordinates
+mds <- plotMDS(dge_filt, 
+               labels = colData(se_filt)$cohort, 
+               col    = as.numeric(factor(colData(se_filt)$cohort)),
+               plot   = FALSE)
+
+```
+
+### Removing confounding variables
+
+We first extract from `colData(se_filt)` the batch and gender variables, treating their levels as numeric factors that will be used to colour and shape the points in our plots. With:
+
+
+```{r, eval = FALSE}
+cols_batch  <- as.numeric(factor(colData(se_filt)$batch.ch1))
+pch_gender  <- as.numeric(factor(colData(se_filt)$gender.ch1))
+```
+
+We then prepare two vectors aligned with the sample order in `se_filt`.
+
+Next, for the PCA, we redraw the first two components obtained with `prcomp` on the log2-CPM matrix, assigning each point a colour according to its batch (`col = cols_batch`) and a symbol according to its sex (`pch = pch_gender`). This plot lets us check whether samples cluster in a way that reflects a technical effect (batch) or a biological one (sex) alongside the main cohort effect.
+
+We then reproduce the same visual scheme on an MDS obtained with `plotMDS(..., plot = FALSE)` from **limma**. We extract the coordinates of the first two dimensions from `mds$eigen.vectors` and build a similar scatterplot, colouring and marking each sample according to `batch.ch1` and `gender.ch1`. In this way we contrast the behaviour of both dimensionality-reduction methods (linear PCA vs. distance-based MDS) and simultaneously assess the influence of batch and sex on the global data structure.
+
+
+## Differential-expression analysis
+
+Next, we extract the filtered raw-count matrix from the "counts" assay of our `se_filt` object and create a `DGEList`, applying TMM normalisation (`calcNormFactors`) to correct for differences in sequencing depth and composition.
+
+To model the comparisons of interest correctly, we rebuild the cohort factor with ordered levels (healthy, Bacterial, COVID-19). We then generate the design matrix `~ batch + gender + cohort`, incorporating batch and gender as confounding covariates and cohort as the main factor. With `makeContrasts()` we define two contrasts: `Bacterial_vs_healthy` and `COVID_vs_healthy`.
+
+The differential analysis is performed with the `voom+limma` workflow: we transform the normalised counts to weighted log2-CPM (`voom()`), fit a linear model (`lmFit`), apply the contrasts (`contrasts.fit`), and moderate the variance (`eBayes`).
+
+Finally, we extract the result tables with `topTable()`, imposing a log2FC threshold of > 1.5 and FDR correction to identify the differentially expressed genes in each comparison.
+
+```{r warning=FALSE}
+# Extract filtered raw counts
+counts_mat <- assay(se_filt, "counts")
+
+# Create a DGEList and calculate TMM factors
+library(edgeR)
+dge <- DGEList(counts = counts_mat)
+dge <- calcNormFactors(dge)
+
+# Reconstruct the cohort factor with valid level names
+cohort_raw <- colData(se_filt)$cohort
+cohort     <- factor(cohort_raw,
+                     levels = c("healthy","Bacterial","COVID-19"))
+levels(cohort) <- c("healthy","Bacterial","COVID.19")
+
+# Design matrix including batch and gender as covariates
+batch  <- factor(colData(se_filt)$batch.ch1)
+gender <- factor(colData(se_filt)$gender.ch1)
+design <- model.matrix(~ batch + gender + cohort)
+
+# Contrasts of interest
+library(limma)
+cont.matrix <- makeContrasts(
+  Bacterial_vs_healthy = cohortBacterial,
+  COVID_vs_healthy     = cohortCOVID.19,
+  levels = design
+)
+
+# voom + linear fit
+v    <- voom(dge, design, plot = FALSE)
+fit  <- lmFit(v, design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+
+# Extract results with a log2FC threshold > 1.5 and FDR < 0.05
+res_bac   <- topTable(fit2,
+                      coef         = "Bacterial_vs_healthy",
+                      adjust.method= "fdr",
+                      p.value      = 0.05,
+                      lfc          = 1.5,
+                      number       = Inf)
+res_covid <- topTable(fit2,
+                      coef         = "COVID_vs_healthy",
+                      adjust.method= "fdr",
+                      p.value      = 0.05,
+                      lfc          = 1.5,
+                      number       = Inf)
+
+```
+
+## Over-representation analysis
+
+First, we selected the up-regulated genes in the COVID-19 vs healthy controls comparison by filtering those with log2FC > 0 and FDR < 0.05 in the `res_covid` table. Next, we converted their Ensembl identifiers to Entrez IDs using `mapIds()` from the `org.Hs.eg.db` package, discarding genes without a mapping. With this vector of Entrez IDs we performed a Gene Ontology enrichment analysis in the “Biological Process” domain with `enrichGO()` from **clusterProfiler**, applying FDR correction and p-value and q-value thresholds of 0.05, and obtaining human-readable GO terms (`readable = TRUE`).
+
+For visualisation with REVIGO, we built a two-column table (`Term` and `P.Value`) from the `@result` slot of `ego_bp`, storing each GO ID together with its adjusted p-value (`p.adjust`). Finally, we saved this table as a tab-delimited file named *revigo_input.txt*, ready to be uploaded to the REVIGO interface and generate summarised plots of semantically redundant terms.
+
+
+```{r message=FALSE, warning=FALSE}
+# Define vector of Ensembl IDs for up-regulated genes
+sig_covid <- res_covid[res_covid$logFC > 0 & res_covid$adj.P.Val < 0.05, ]
+genes_ens <- rownames(sig_covid)
+
+# Convert Ensembl → Entrez IDs
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+entrez_ids <- mapIds(org.Hs.eg.db,
+                     keys       = genes_ens,
+                     column     = "ENTREZID",
+                     keytype    = "ENSEMBL",
+                     multiVals  = "first")
+# Remove NAs
+entrez_ids <- na.omit(entrez_ids)
+
+# 3) GO Biological Process enrichment
+library(clusterProfiler)
+ego_bp <- enrichGO(gene          = entrez_ids,
+                   OrgDb         = org.Hs.eg.db,
+                   keyType       = "ENTREZID",
+                   ont           = "BP",
+                   pAdjustMethod = "fdr",
+                   pvalueCutoff  = 0.05,
+                   qvalueCutoff  = 0.05,
+                   readable      = TRUE)
+
+```
+
+```{r}
+# Build table with GO ID and adjusted value
+revigo_input <- data.frame(
+  Term    = ego_bp@result$ID,
+  P.Value = ego_bp@result$p.adjust
+)
+
+# Save as tab-delimited
+write.table(
+  revigo_input,
+  file      = "revigo_input.txt",
+  sep       = "\t",
+  quote     = FALSE,
+  row.names = FALSE
+)
+
+```
+
+# Results
+
+## Construction of the `SummarizedExperiment` object
+
+
+```{r echo=FALSE}
+#  final inspect
+se
+dim(se)  
+```
+
+# Results
+
+## Construction of the `SummarizedExperiment` object
+
+The `RangedSummarizedExperiment` built in **'[Construction of the SummarizedExperiment object]'** contains 57 602 genes and 193 samples. The `assays` slot stores the filtered raw-count matrix; `rowRanges` includes genomic coordinates and annotation metadata (Ensembl IDs, gene names, biotype, symbol, EntrezID); and `colData` holds the 68 metadata fields for each sample (GEO accession, cohort, age, gender, batch, time since symptom onset, etc.), plus `subject_id_clean`.
+
+## Selection of the cohorts of interest and samples
+
+The object `se_sub` before filtering contained 57 602 genes × 118 samples (23 bacterial, 77 COVID-19, 18 healthy). After randomly selecting 75 samples with a seed based on my first and last names, we obtained a new object with 57 602 genes × 75 samples (13 bacterial, 48 COVID-19, 14 healthy).
+
+Before selection:
+
+```{r echo=FALSE}
+dim(se_sub)                              # genes × samples retained
+table(colData(se_sub)$cohort)            # sample number by cohort
+```
+
+After selection:
+
+```{r echo=FALSE}
+# check dims and distribution by cohort
+dim(se_rand)                    
+table(colData(se_rand)$cohort)  # sample number by group
+```
+
+## Filtering lowly expressed genes
+
+After applying `filterByExpr` from **edgeR**, we removed very low-expression genes and went from 57 602 to 21 072 retained genes in the filtered object (`se_filt`), while keeping the 75 selected samples.
+
+
+```{r echo=FALSE}
+# Información de cuántos genes se mantienen
+cat("Genes antes:", nrow(dge$counts), 
+    "→ después:", sum(keep), "\n")
+
+# Ver dims
+dim(se_filt)  
+
+```
+
+## Exploratory analysis
+
+### Principal components
+
+
+```{r echo=FALSE}
+# % of variance explained by each PC
+var_exp <- (pca$sdev^2) / sum(pca$sdev^2)
+cat("First 5 principal components in percentage:", round(var_exp[1:5] * 100, 2))  # first 5 PCs in %
+
+```
+
+```{r echo=FALSE, fig.cap="Principal component analysis (PCA) of normalized log2-CPM expression in 75 samples. The plot displays PC1 (13.8 % variance) versus PC2 (11.7 % variance)."}
+
+# Dibujar PC1 vs PC2 coloreando por cohorte
+plot(pca$x[,1], pca$x[,2],
+     col = as.numeric(factor(colData(se_filt)$cohort)),
+     pch = 19,
+     xlab = paste0("PC1 (", round(var_exp[1]*100,1), "%)"),
+     ylab = paste0("PC2 (", round(var_exp[2]*100,1), "%)"))
+legend("topright",
+       legend = levels(factor(colData(se_filt)$cohort)),
+       col    = seq_along(levels(factor(colData(se_filt)$cohort))),
+       pch    = 19)
+```
+
+Principal-component analysis of the log2-CPM matrix shows that the first two components capture roughly 13.8 % (the first component) and 11.7 % (the second component) of the total variability. In the PC1–PC2 space, samples from bacterial pneumonia cluster distinctly on the far left of PC1, whereas most COVID-19 samples are shifted to the right. Healthy controls occupy an intermediate position, overlapping to some extent with both groups along PC2. This pattern indicates that the type of infection is the main driver of variation among the samples.
+
+### MDS
+
+```{r echo=FALSE, fig.cap="MDS of 75 samples (log2-CPM)"}
+cols <- as.numeric(factor(colData(se_filt)$cohort))
+pch  <- 16
+
+plot(mds,
+     col    = cols,
+     pch    = pch,
+     main   = "MDS (log-CPM)",
+     xlab   = paste0("Dim1 (", round(mds$var.explained[1]*100,1), "%)"),
+     ylab   = paste0("Dim2 (", round(mds$var.explained[2]*100,1), "%)"))
+legend("topright",
+       legend = levels(factor(colData(se_filt)$cohort)),
+       col    = unique(cols),
+       pch    = pch)
+
+```
+
+These results reinforce the PCA observation: the primary variability in the data is driven by infection type, particularly the pronounced difference between bacterial infections and the other two conditions.
+
+### Removing confounding variables
+
+
+```{r echo=FALSE, fig.cap="PCA of the 75 samples coloured by batch (batch.ch1: 1 = black, 2 = red) and point shape according to gender (circle = female, triangle = male). The first two components explain 13.8 % and 11.7 % of the total variance, respectively."}
+# Define colours and symbols for batch and gender
+cols_batch  <- as.numeric(factor(colData(se_filt)$batch.ch1))
+pch_gender  <- as.numeric(factor(colData(se_filt)$gender.ch1))
+
+# Redraw PC1 vs PC2 with these attributes
+plot(pca$x[, 1], pca$x[, 2],
+     col  = cols_batch,
+     pch  = pch_gender,
+     xlab = "PC1", ylab = "PC2",
+     main = "PCA coloured by batch (colour) and gender (shape)")
+legend("topright",
+       legend = levels(factor(colData(se_filt)$batch.ch1)),
+       col    = seq_along(unique(cols_batch)),
+       pch    = 15,
+       title  = "Batch")
+legend("bottomright",
+       legend = levels(factor(colData(se_filt)$gender.ch1)),
+       col    = "black",
+       pch    = unique(pch_gender),
+       title  = "Gender")
+
+
+```
+
+```{r echo=FALSE, fig.cap="MDS of the 75 samples (distances on log2-CPM) coloured by batch and shaped by gender"}
+# Recalculate MDS 
+library(limma)
+mds <- plotMDS(dge_filt, plot = FALSE)
+
+# Extract the coordinates from eigen.vectors
+coords   <- mds$eigen.vectors       # 75 samples × 75 eigenvectors matrix
+x_mds    <- coords[, 1]             # Dimension 1
+y_mds    <- coords[, 2]             # Dimension 2
+var1_mds <- round(mds$var.explained[1] * 100, 1)
+var2_mds <- round(mds$var.explained[2] * 100, 1)
+
+# Define colour and symbol as in the PCA
+cols_batch  <- as.numeric(factor(colData(se_filt)$batch.ch1))
+pch_gender  <- as.numeric(factor(colData(se_filt)$gender.ch1))
+
+# Draw the MDS plot coloured by batch and shaped by gender
+plot(x_mds, y_mds,
+     col  = cols_batch,
+     pch  = pch_gender,
+     xlab = paste0("Dim1 (", var1_mds, "%)"),
+     ylab = paste0("Dim2 (", var2_mds, "%)"),
+     main = "MDS coloured by batch and gender")
+
+legend("topright",
+       legend = levels(factor(colData(se_filt)$batch.ch1)),
+       col    = seq_along(unique(cols_batch)),
+       pch    = 15,
+       title  = "Batch")
+legend("bottomright",
+       legend = levels(factor(colData(se_filt)$gender.ch1)),
+       col    = "black",
+       pch    = unique(pch_gender),
+       title  = "Gender")
+
+
+```
+
+In both PCA and MDS dimensionality reductions, the cohort’s biological effect remains the primary determinant of the expression pattern, but we also observe a slight technical bias due to batch: samples processed in batch 2 tend to shift consistently relative to batch 1. Conversely, sex shows a weaker and more scattered effect, without clearly grouping samples by gender. These findings confirm the need to include at least batch in the design matrix of the differential-expression analysis (and, if maximal correction is desired, also gender) to ensure that detected changes are attributable solely to the differences among COVID-19, bacterial pneumonia, and healthy controls.
+
+## Differential-expression analysis
+
+![Mean–variance trend calculated by voom: each black point represents a gene](voom.png)
+
+The voom mean–variance trend plot shows how the standard deviation of the weighted log2-CPM values (y-axis) decreases as the mean gene expression increases (x-axis), stabilising for genes of intermediate and high abundance.
+
+```{r echo=FALSE}
+# Show tables for 6 first gene in each contrast
+list(
+  Bacterial_vs_Healthy = head(res_bac,   6),
+  COVID19_vs_Healthy   = head(res_covid, 6))
+```
+
+In the Bacterial pneumonia vs healthy controls comparison ($\lvert \log_{2}FC \rvert \ge 1.5$, FDR < 0.05) we identified hundreds of differentially expressed genes, with ENSG00000007237 ($\log_{2}FC = +3.11$, FDR = $5.8 \times 10^{-23}$), ENSG00000170525 ($\log_{2}FC = +4.51$, FDR = $1.9 \times 10^{-22}$), and ENSG00000079277 ($\log_{2}FC = +2.99$, FDR = $1.9 \times 10^{-22}$) standing out, highlighting a strong induction of gene programs in response to bacterial infection.
+
+In the COVID-19 vs healthy controls comparison, using the same $\log_{2}FC$ and FDR criteria, we also observe hundreds of altered genes, the most prominent being ENSG00000109475 ($\log_{2}FC = -2.65$, FDR = $2.0 \times 10^{-9}$), ENSG00000138326 ($\log_{2}FC = -2.05$, FDR = $4.5 \times 10^{-9}$), and ENSG00000071082 ($\log_{2}FC = -2.39$, FDR = $7.2 \times 10^{-9}$), reflecting the repression of transcriptional processes during SARS-CoV-2 infection.
+
+## Over-representation analysis
+
+```{r echo=FALSE}
+# Most significative terms
+head(ego_bp)
+```
+
+The transcriptomic response in peripheral blood from COVID-19 patients appears to be characterized by the activation of mitotic and cell-division pathways. Among the 15 genes significantly over-expressed in COVID-19 versus healthy controls, the GO-BP analysis shows a pronounced enrichment for processes related to the mitotic cell cycle. The six most significant terms include “spindle assembly” (5/15 genes, ~46× fold enrichment), “spindle organization” (5/15, ~30×), “nuclear division” (6/15, ~17×), “organelle fission” (6/15, ~15×), “mitotic nuclear division” (5/15, ~22×) and “nuclear chromosome segregation” (5/15, ~19×).
+
+![Scatter plot of enriched GO-BP terms among genes over-expressed in COVID-19 patients versus healthy controls, visualized with REVIGO. Bubble size reflects the number of associated genes (log_size) and color represents significance (–log10(adjusted p-value)). Mitotic, immune, and tissue-remodeling processes cluster into distinct semantic regions.](enrichment.png)
+
+
+The REVIGO scatter plot places the enriched GO Biological Process terms in the context of their semantic similarity. Each bubble represents one term, whose size (log_size) indicates the number of associated genes, and whose colour encodes the level of significance (–log10(adjusted p-value)). The coordinates on the “semantic space x” and “semantic space y” axes are arbitrary, but they cluster biologically related processes together [5].
+
+In the lower-left quadrant, a cluster of mitotic processes—“spindle assembly”, “nuclear division”, and “chromosome segregation”—stands out, characterised by small bubbles (few genes) in blue-green tones, reflecting high significance. To the right, a second group clusters immune-defence pathways (“complement activation”, “cell killing”, “complement-dependent cytotoxicity”) with medium-sized bubbles in yellow-orange tones. Finally, in the upper-central region appear tissue-remodelling and developmental processes (“fibroblast proliferation”, “collagen catabolic process”, “protein refolding”, “chorion development”) with larger yellow bubbles, indicating moderate enrichment but involving more genes.
+
+# Discussion
+
+The integration of RNA-seq counts with GEO metadata and the construction of a `SummarizedExperiment` object allowed us to rigorously normalise and explore the transcriptomic signatures in COVID-19, bacterial pneumonia, and healthy controls. PCA and MDS confirm that cohort is the main source of variation, with a slight batch effect and a secondary impact of sex, which justifies their inclusion in the differential-expression design.
+
+The *voom+limma* pipeline, adjusted for batch and gender, identifies hundreds of genes with \(\lvert \log_{2}\mathrm{FC}\rvert \ge 1.5\) and FDR < 0.05 in both comparisons. Whereas bacterial pneumonia shows a strong induction of pro-inflammatory genes, COVID-19 is characterised by transcriptional repression and an unexpected activation of mitotic processes in peripheral blood.
+
+GO-BP enrichment and its REVIGO summary reveal three functional axes—mitosis, immune cytotoxicity, and tissue remodelling—suggesting that SARS-CoV-2 affects not only the classical immune response but also the proliferative dynamics of blood cells.
+
+The comparison of our peripheral blood transcriptomic signatures with the findings of McClain et al. (2021) reveals convergence on several biological axes, as well as complementary insights that enrich our interpretation. Similar to that study, we observe marked heterogeneity in interferon responses—with some ISGs up-regulated and others down-regulated—suggesting a characteristic disruption of type I IFN signalling during SARS-CoV-2 infection :contentReference[oaicite:0]{index=0}. 
+
+However, while McClain et al. emphasize an early activation of antiviral defence and B-cell pathways (e.g., CD79A/B, IGH, detectable from day 1) and derive a 23–139-gene signature capable of discriminating COVID-19 from other infections with an auROC aprox. 0.95 :contentReference[oaicite:1]{index=1}, our analysis unexpectedly highlights a mitotic activation component (spindle assembly, nuclear division, organelle fission) in COVID-19 versus healthy controls.
+
+Moreover, McClain et al. also describe disruptions in coagulation/fibrinolysis pathways (KLKB1, F12, SERPINE1, PROS1) and modulation of IL-1, JAK/STAT, and IL-6 signalling—characterized by a hypo-inflammatory profile early in disease and heterogeneous elevations in later phases :contentReference[oaicite:2]{index=2}. Although our design did not include influenza or seasonal coronavirus controls, the pronounced induction of mitotic processes we identify may reflect a compensatory mechanism or the proliferation of a specific cell subset (e.g., progenitors or plasmablasts) in response to the inflammatory imbalance and haemostatic alterations noted by McClain et al.
+
+These findings confirm that beyond the classic interferon signature, SARS-CoV-2 induces a multifaceted reconfiguration of the peripheral transcriptome:
+
+- **Antiviral and humoral response**: elevated ISGs and immunoglobulin genes, consistent with McClain et al. :contentReference[oaicite:3]{index=3}.
+- **Inflammatory and haemostatic modulation**: atypical IL-1/JAK-STAT patterns and coagulation/fibrinolysis pathway changes.
+- **Mitotic activation**: our most distinctive finding, suggesting peripheral blood cell proliferation potentially linked to repair mechanisms or immune lineage expansion.
+
+
+# Conclusions
+
+- Cohort (COVID-19, bacterial pneumonia, healthy) remains the principal driver of peripheral-blood transcriptomic variation, with batch and sex effects appropriately adjusted in the design.  
+- Our *voom+limma* analysis (|\(\log_{2}\mathrm{FC}\)| > 1.5, FDR < 0.05) confirms McClain et al.’s interferon- and immunoglobulin-driven signature in COVID-19—yet also reveals a novel mitotic activation programme (spindle assembly, nuclear division, organelle fission) not highlighted previously.  
+- Bacterial pneumonia displays a robust induction of pro-inflammatory and coagulation/fibrinolysis pathways, whereas COVID-19 samples show both transcriptional repression in classic immune genes and up-regulation of cell-cycle processes, suggesting compensatory proliferation (e.g., plasmablasts or progenitors).  
+- GO-BP enrichment and REVIGO summarization unify three axes—mitosis, immune cytotoxicity, and tissue remodelling—underscoring that SARS-CoV-2 reprogrammes not only antiviral immunity but also haemostatic balance and cell-proliferation programmes in peripheral blood.
+
+
+# References
+
+[1] McClain, Micah T et al. “Dysregulated transcriptional responses to SARS-CoV-2 in the periphery.” Nature communications vol. 12,1 1079. 17 Feb. 2021, doi:10.1038/s41467-021-21289-y
+
+[2] Chen Y, Lun ATL, and Smyth, GK (2016). From reads to genes to pathways: differential expression analysis of RNA-Seq experiments using Rsubread and the edgeR quasi-likelihood pipeline. F1000Research 5, 1438. http://f1000research.com/articles/5-1438 
+
+[3] Greenacre, M., Groenen, P.J.F., Hastie, T. et al. Principal component analysis. Nat Rev Methods Primers 2, 100 (2022). https://doi.org/10.1038/s43586-022-00184-w
+
+[4] Nasir Saeed, Haewoon Nam, Mian Imtiaz Ul Haq, and Dost Bhatti Muhammad Saqib. 2018. A Survey on Multidimensional Scaling. ACM Comput. Surv. 51, 3, Article 47 (May 2019), 25 pages. https://doi.org/10.1145/3178155
+
+[5]  Supek F, Bošnjak M, Škunca N, Šmuc T (2011) REVIGO Summarizes and Visualizes Long Lists of Gene Ontology Terms. PLOS ONE 6(7): e21800. https://doi.org/10.1371/journal.pone.0021800 
+
+# Anexus
+
+
+```{r, eval = FALSE}
+
+
+# A plotting R script produced by the Revigo server at http://revigo.irb.hr/
+# If you found Revigo useful in your work, please cite the following reference:
+# Supek F et al. "REVIGO summarizes and visualizes long lists of Gene Ontology
+# terms" PLoS ONE 2011. doi:10.1371/journal.pone.0021800
+
+# --------------------------------------------------------------------------
+# If you don't have the ggplot2 package installed, uncomment the following line:
+# install.packages( "ggplot2" );
+library( ggplot2 );
+
+# --------------------------------------------------------------------------
+# If you don't have the scales package installed, uncomment the following line:
+# install.packages( "scales" );
+library( scales );
+
+# --------------------------------------------------------------------------
+# Here is your data from Revigo. Scroll down for plot configuration options.
+
+revigo.names <- c("term_ID","description","frequency","plot_X","plot_Y","log_size","value","uniqueness","dispensability");
+revigo.data <- rbind(c("GO:0000002","mitochondrial genome maintenance",0.06554336753744247,-6.259821644806856,-3.4781447388768605,4.425371166438941,-1.3263022420909696,0.8849516129403562,0.36747417),
+c("GO:0000280","nuclear division",0.43374453844241945,-5.770988064614843,-2.9554586835027727,5.24606259034848,-4.1732326084848745,0.8251889293690234,0.42549178),
+c("GO:0001788","antibody-dependent cellular cytotoxicity",0.0001501425295649101,5.1039142827992015,2.9394621340669573,1.792391689498254,-1.6319571734385814,0.8585935280064109,0.68415942),
+c("GO:0001890","placenta development",0.012919641601413328,0.25489092657336215,6.6209013916071555,3.720159303405957,-0.8546767557985312,0.951300039401438,0.551383),
+c("GO:0001906","cell killing",0.05707631341115902,6.941402586438603,-2.1155370837861773,4.365300748637988,-0.6904711589359435,0.992917021883937,0.0106825),
+c("GO:0002040","sprouting angiogenesis",0.025684217967374374,1.4029727926060354,6.19137302452011,4.018534070428183,-0.7809862106736092,0.9372902724739206,0.46293407),
+c("GO:0002437","inflammatory response to antigenic stimulus",0.005311599652476655,5.080435132688191,2.403033446701412,3.334252642334231,-1.0594611511303471,0.8732683374839947,0.54719861),
+c("GO:0002520","immune system development",0.03717135215556184,2.21985129437037,5.128085398719903,4.17906322239498,-0.7744843415636153,0.8467921333410908,0.56679695),
+c("GO:0002526","acute inflammatory response",0.014610591073726333,5.854936530155104,2.147492382388848,3.7735670489260587,-0.9569979172847317,0.9334223540735122,0.6867114),
+c("GO:0006260","DNA replication",1.4421509940592292,-5.31921181180662,5.192584920007242,5.767837581402916,-0.6693432556819996,0.964726637610796,0.59882544),
+c("GO:0006278","RNA-templated DNA biosynthetic process",0.17927264165344634,-4.880888328760733,5.361997398987922,4.862346087237822,-1.1013049310017693,0.9582421464199157,0.24206009),
+c("GO:0006310","DNA recombination",1.827734239452524,-5.190752862775078,5.210824089798946,5.870739739053611,-0.5929376721525201,0.9640147972522354,0.66164169),
+c("GO:0006457","protein folding",1.1925033490398829,-4.132689541310154,6.113551762643961,5.685286610314463,-0.7401082204944844,0.9683054611899719,0.69676336),
+c("GO:0006958","complement activation, classical pathway",0.019520990196382,4.399119947275016,-0.7834346051645509,3.8993827055332653,-2.437131823778386,0.6718454555489743,0.13604753),
+c("GO:0006959","humoral immune response",0.05994378959055443,4.721057436911085,2.5211645126302717,4.386588133907789,-1.3169654228496617,0.8682576169484952,0.63028536),
+c("GO:0007004","telomere maintenance via telomerase",0.0454661115757872,-5.089576192520205,-1.2665605076913067,4.266537430234306,-1.1249778286575336,0.8437928045756009,0.68888977),
+c("GO:0007005","mitochondrion organization",0.6594013763196482,-5.830468901922794,-3.4586017913808442,5.4279775769010445,-0.5153695547689309,0.8642242539054771,0.49357556),
+c("GO:0007059","chromosome segregation",0.6817307702247771,-6.891164964139785,1.4156834848039654,5.442440571042678,-3.331985488229143,0.7820819552386191,0.68014205),
+c("GO:0007163","establishment or maintenance of cell polarity",0.22665860852530942,0.194714954497797,-0.3675764914844951,4.964203040909922,-0.7400913348351181,0.9921834815574166,0.01212612),
+c("GO:0007605","sensory perception of sound",0.0593038378251958,2.6431752443178698,5.80013234361473,4.381926930637227,-0.8265831760302264,0.9491368509131922,0.40602063),
+c("GO:0009408","response to heat",0.3335994712226244,5.787098437370566,1.571858722571108,5.132054664397105,-0.9714369441016658,0.9405091580061629,0.41180767),
+c("GO:0010458","exit from mitosis",0.0015604977662975902,-6.458901012246711,-0.89027388044292,2.8027737252919755,-1.304008835978288,0.7753020701996325,0.65966104),
+c("GO:0010639","negative regulation of organelle organization",0.26324415868027373,1.74383376037818,-5.722869200206071,5.029188910280547,-2.715364426136827,0.6189271695657912,0.51706487),
+c("GO:0010948","negative regulation of cell cycle process",0.3342984954586315,0.8714722922661182,-6.447622328909372,5.132963726130726,-2.8083146739287304,0.567565351194172,-0),
+c("GO:0022411","cellular component disassembly",0.49554664950545757,-5.846147052397789,-4.179749036258854,5.303912807769549,-1.1151089537477745,0.8968132210803362,0.33224771),
+c("GO:0030010","establishment of cell polarity",0.09436581050801783,7.066748592738407,-1.10862276497943,4.583652108542044,-0.8381871750169465,0.9866811940307019,0.01108052),
+c("GO:0030199","collagen fibril organization",0.023070261141178723,-5.374682760114819,-4.741367680342497,3.9719249491841913,-1.1013049310017693,0.9046750659148265,0.24619267),
+c("GO:0030574","collagen catabolic process",0.04133842268922402,-0.36580287693507824,1.1587683778458928,4.225205865965902,-1.209032758596835,0.9967976900397587,0.0324515),
+c("GO:0031503","protein-containing complex localization",0.2665596010954202,-2.773424267002288,4.021334234877868,5.0346244465007866,-0.754693981071753,0.9853201718901953,0.20477458),
+c("GO:0032147","activation of protein kinase activity",0.0308678272667793,3.9683956675947796,-3.9500103767824246,4.098366796439331,-1.1507061184558658,0.7478011491368385,0.65511504),
+c("GO:0032200","telomere organization",0.19561848655247202,-6.013691890372712,-3.150034038569182,4.900241465533459,-0.7904506943979958,0.8588169584975955,0.43613539),
+c("GO:0032211","negative regulation of telomere maintenance via telomerase",0.007169921124960378,2.0613304031880397,-4.906400666695393,3.4644895474339714,-1.433579168192349,0.6281515684870619,0.69632437),
+c("GO:0032271","regulation of protein polymerization",0.22037477446007636,1.918005063537686,-5.538140390611946,4.951992837947356,-0.7787153456936111,0.6824755187811306,0.69102529),
+c("GO:0032886","regulation of microtubule-based process",0.17552892382609833,2.461564857015948,-6.7985617502335085,4.853180886542993,-1.4104606329432117,0.8523230700016117,0.17399073),
+c("GO:0032963","collagen metabolic process",0.04852065057890283,2.298348586547254,0.47956362460884305,4.294774752218443,-0.9569979172847317,0.9967614260506874,0.03282624),
+c("GO:0032984","protein-containing complex disassembly",0.3227941317998383,-4.957254803089621,-3.890216839354477,5.117755048991034,-1.4252319885776583,0.887629682358528,0.29915509),
+c("GO:0042026","protein refolding",0.19468809513975832,-3.8988505751852345,6.304826292179276,4.8981709930144,-1.3651889954678953,0.9713827700553997,0.0117089),
+c("GO:0042742","defense response to bacterium",0.1321229646641772,5.799335990256828,1.9033505694017834,4.729812507160935,-1.2555265358058965,0.9318570445677096,0.19438773),
+c("GO:0043029","T cell homeostasis",0.008279991302563239,3.2186282284982073,4.5221390721068655,3.5269850685599957,-1.1936723330043257,0.8638692750554149,0.51935367),
+c("GO:0043062","extracellular structure organization",0.23198743764839191,-5.15656387046929,-4.31121895246063,4.974295182354866,-0.6033552220120568,0.9025311472292652,0.31088137),
+c("GO:0043244","regulation of protein-containing complex disassembly",0.24929813290134295,2.045827651697069,-5.624401494836771,5.0055494202572985,-0.9112388272811409,0.6868177645365301,0.69816593),
+c("GO:0043523","regulation of neuron apoptotic process",0.03835034021558793,4.932192615466645,-4.896813556258204,4.192623200012946,-0.699203711641298,0.8630210729478845,0.62409525),
+c("GO:0043525","positive regulation of neuron apoptotic process",0.01144036848225741,4.78767044911135,-3.8018084663914844,3.667359546183087,-1.1013049310017693,0.8009329970710626,0.33848613),
+c("GO:0044771","meiotic cell cycle phase transition",0.0004208913533704856,-6.579494231783464,1.8376717296167226,2.2355284469075487,-2.8356969277133848,0.8254644425142289,0.4143032),
+c("GO:0044786","cell cycle DNA replication",0.09954695845447907,-6.191460291320214,2.5185093366776625,4.606864839752301,-1.209032758596835,0.7827575457281161,0.5827846),
+c("GO:0044839","cell cycle G2/M phase transition",0.01907548531357464,-6.969446166277071,1.6484545147302576,3.8893577368889316,-2.619472403051033,0.8122847330017701,0.61838628),
+c("GO:0045229","external encapsulating structure organization",1.2096737471750436,-5.562604688414026,-3.983854391513781,5.691495245716783,-0.6033552220120568,0.8892003270466209,0.37739539),
+c("GO:0045766","positive regulation of angiogenesis",0.03182037085598619,4.597736423635044,-3.23372542101206,4.111564935454498,-0.7859167079281926,0.7907224820807134,0.35935223),
+c("GO:0046785","microtubule polymerization",0.08265961590784222,-5.266901704474342,-3.242334611543995,4.526132421238326,-1.9874680560091085,0.8375369101572641,0.68795183),
+c("GO:0048144","fibroblast proliferation",0.003384360297569695,1.4031204053908497,1.8351792951268162,3.1386184338994925,-0.9583134513631324,0.9940583164343024,0.00888846),
+c("GO:0048285","organelle fission",0.5008139448049479,-5.629838905453105,-3.335624603230398,5.3085046539438085,-4.030064103106153,0.8670674758336262,0.47432026),
+c("GO:0048732","gland development",0.05944413494298596,0.20536382638593084,6.446338919971726,4.382953100015041,-1.1212576669338647,0.9472321518516013,0.52180629),
+c("GO:0050000","chromosome localization",0.10568311134309089,-3.1617716107234943,2.9967115766112338,4.6328418116607235,-1.8475918624225298,0.9528773196152904,-0),
+c("GO:0050954","sensory perception of mechanical stimulus",0.06226238406350763,2.604153387429476,5.69282911566351,4.4030690207529775,-0.7812317113908965,0.9490001851356046,0.68788933),
+c("GO:0051225","spindle assembly",0.14606652909016435,-6.159497641503413,-1.4008181990276294,4.773384134177155,-4.847292621224302,0.7194964337877949,0),
+c("GO:0051258","protein polymerization",0.1736164525888535,-4.881714788680789,-3.617368096996544,4.848423141732414,-1.3752344121635063,0.8878824293475613,0.57204412),
+c("GO:0051293","establishment of spindle localization",0.06700541118599257,-5.868616255116801,-0.8440380570047504,4.434951936087753,-1.1269154279928095,0.7298895599759971,0.6909899),
+c("GO:0051302","regulation of cell division",0.16835161864230688,3.2425893410916666,-6.312080557266651,4.835049752339172,-1.594721678154095,0.8527502030997128,0.17338979),
+c("GO:0051304","chromosome separation",0.03391498221106387,-7.132317713272933,1.316494713358019,4.139249217571607,-2.083764259985494,0.8071804676338031,0.68250547),
+c("GO:0051306","mitotic sister chromatid separation",0.005225452299447608,-6.3142965817512104,-1.1643062448118768,3.3271545124094315,-2.2618509847924417,0.7587520621278309,0.68891694),
+c("GO:0051338","regulation of transferase activity",0.45600747581806883,3.9902690783390526,-5.459370916374411,5.267800413255474,-1.1105090267707172,0.8272583179945358,0.16548373),
+c("GO:0051402","neuron apoptotic process",0.019794200373131263,-0.8565707583872858,2.9425696930900758,3.905418068702542,-0.6344736056797262,0.9933929484380674,0.00993114),
+c("GO:0051653","spindle localization",0.06821147412839923,-6.169140685732736,1.780014616353336,4.44269921263019,-1.1105090267707172,0.7934279774711663,0.6918615),
+c("GO:0051988","regulation of attachment of spindle microtubules to kinetochore",0.007211764125003059,-0.27593890458084824,-7.21947071597524,3.4670158184384356,-1.424419633195438,0.6840711476402601,0.65733195),
+c("GO:0060707","trophoblast giant cell differentiation",0.0012355991777308994,0.5629729151067154,5.720329305458087,2.7015679850559273,-1.6222431116240916,0.8842268214547688,0.2872773),
+c("GO:0060717","chorion development",0.0007974783537546043,-0.16160346920657387,6.821490010453913,2.5118833609788744,-1.6319571734385814,0.965021298689673,-0),
+c("GO:0061008","hepaticobiliary system development",0.022952116199881745,1.356530068918793,6.02936864999832,3.9696954111184732,-0.8609123178508677,0.937672745290207,0.37954564),
+c("GO:0061640","cytoskeleton-dependent cytokinesis",0.16478019552101697,-7.073486059850885,1.4914617355816742,4.825737607457994,-0.9202059869178412,0.8008518389681343,0.68733641),
+c("GO:0070365","hepatocyte differentiation",0.005104846005206943,1.1277737717701781,6.20616376053117,3.3170181010481117,-1.5824503798003227,0.9258080513448692,0.42639481),
+c("GO:0071897","DNA biosynthetic process",0.7699653505500705,-4.820524587414945,5.526678812668085,5.4952986766316325,-0.8161150036113213,0.9555401229770331,0.4872549),
+c("GO:0090235","regulation of metaphase plate congression",0.0031283795914262415,-2.053249054159235,-7.678944422059645,3.104487111312395,-1.5637376429946066,0.8896831606314495,0.12054981),
+c("GO:0090306","meiotic spindle assembly",0.0014521982367753598,-6.092643768628381,-0.8206609700366004,2.7715874808812555,-2.917682968354917,0.7546678504690428,0.6532207),
+c("GO:0097278","complement-dependent cytotoxicity",0.00019444688255127702,5.4181319425278796,4.572837473536946,1.9030899869919435,-1.6222431116240916,0.9860169104985459,0.00759817),
+c("GO:0140588","chromatin looping",0.0005267295299490289,-4.726720543454419,-5.403390483432511,2.3324384599156054,-0.8271253256190485,0.9326008087029027,0.19638696),
+c("GO:1901976","regulation of cell cycle checkpoint",0.016185856957686044,0.15482612818437633,-6.8844886769578855,3.8180278418592564,-2.3476505596629735,0.6500746642051636,0.69415904),
+c("GO:1902412","regulation of mitotic cytokinesis",0.008787030008962771,-0.07702572713827012,-7.258042832372896,3.552789850192782,-1.5431088283446694,0.6691432374931249,0.66596626),
+c("GO:1902423","regulation of attachment of mitotic spindle microtubules to kinetochore",0.002584420590871403,0.36605259764524595,-6.670710381987899,3.021602716028242,-1.6319571734385814,0.5840449626379576,0.61585698),
+c("GO:1903867","extraembryonic membrane development",0.0010313068834048743,-0.30427834620046407,6.52202784365559,2.6232492903979003,-1.591408230319938,0.9646062567555423,0.29051942),
+c("GO:1990823","response to leukemia inhibitory factor",0.008910097656147123,6.2327414655180196,0.6971509850669118,3.5588285248170117,-0.9656659655014851,0.9598834800898999,0.62339641),
+c("GO:1990830","cellular response to leukemia inhibitory factor",0.008686114538271603,6.375027234132312,0.7984358102289623,3.5477747053878224,-0.9714369441016658,0.9599353072927503,0.16481552),
+c("GO:2000105","positive regulation of DNA-templated DNA replication",0.015836344839682485,3.801000995443936,-3.1928461502646956,3.8085485512404054,-1.5824503798003227,0.758459144017008,0.34485102),
+c("GO:2000241","regulation of reproductive process",0.14026758155483765,0.6838688066694735,-4.126408823617196,4.755791036368597,-0.7721179081427381,0.8639722640306147,0.15791292),
+c("GO:2000278","regulation of DNA biosynthetic process",0.018755509430895326,2.5332710630269815,-3.3052515745631603,3.8820119616266586,-1.0048980578702251,0.8152163921491319,0.68250424),
+c("GO:2001252","positive regulation of chromosome organization",0.020535067609181064,2.936905389392559,-4.587626531029483,3.9213742954184743,-0.9714369441016658,0.6281873848377015,0.65863915));
+
+one.data <- data.frame(revigo.data);
+names(one.data) <- revigo.names;
+one.data <- one.data [(one.data$plot_X != "null" & one.data$plot_Y != "null"), ];
+one.data$plot_X <- as.numeric( as.character(one.data$plot_X) );
+one.data$plot_Y <- as.numeric( as.character(one.data$plot_Y) );
+one.data$log_size <- as.numeric( as.character(one.data$log_size) );
+one.data$value <- as.numeric( as.character(one.data$value) );
+one.data$frequency <- as.numeric( as.character(one.data$frequency) );
+one.data$uniqueness <- as.numeric( as.character(one.data$uniqueness) );
+one.data$dispensability <- as.numeric( as.character(one.data$dispensability) );
+#head(one.data);
+
+
+# --------------------------------------------------------------------------
+# Names of the axes, sizes of the numbers and letters, names of the columns,
+# etc. can be changed below
+
+p1 <- ggplot( data = one.data );
+p1 <- p1 + geom_point( aes( plot_X, plot_Y, colour = value, size = log_size), alpha = I(0.6) );
+p1 <- p1 + scale_colour_gradientn( colours = c("blue", "green", "yellow", "red"), limits = c( min(one.data$value), 0) );
+p1 <- p1 + geom_point( aes(plot_X, plot_Y, size = log_size), shape = 21, fill = "transparent", colour = I (alpha ("black", 0.6) ));
+p1 <- p1 + scale_size( range=c(5, 30)) + theme_bw(); # + scale_fill_gradientn(colours = heat_hcl(7), limits = c(-300, 0) );
+ex <- one.data [ one.data$dispensability < 0.15, ];
+p1 <- p1 + geom_text( data = ex, aes(plot_X, plot_Y, label = description), colour = I(alpha("black", 0.85)), size = 3 );
+p1 <- p1 + labs (y = "semantic space x", x = "semantic space y");
+p1 <- p1 + theme(legend.key = element_blank()) ;
+one.x_range = max(one.data$plot_X) - min(one.data$plot_X);
+one.y_range = max(one.data$plot_Y) - min(one.data$plot_Y);
+p1 <- p1 + xlim(min(one.data$plot_X)-one.x_range/10,max(one.data$plot_X)+one.x_range/10);
+p1 <- p1 + ylim(min(one.data$plot_Y)-one.y_range/10,max(one.data$plot_Y)+one.y_range/10);
+
+
+# --------------------------------------------------------------------------
+# Output the plot to screen
+
+p1;
+
+
+
+
+```
+
+
