@@ -377,16 +377,6 @@ write.table(
 
 ```
 
-# Results
-
-## Construction of the `SummarizedExperiment` object
-
-
-```{r echo=FALSE}
-#  final inspect
-se
-dim(se)  
-```
 
 # Results
 
